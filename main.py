@@ -3,10 +3,10 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 import secrets
 import string
-from datetime import datetime, timedelta
+from datetime import datetime
 from pydantic import BaseModel
-from database import get_db, create_tables, QRToken, TokenType
-from sqlalchemy import and_, or_
+from database import get_db, reset_database, create_tables, QRCode, RegistroEscaneo
+from sqlalchemy import desc
 
 # Importación condicional de qrcode
 try:
@@ -17,570 +17,642 @@ try:
 except ImportError:
     QR_AVAILABLE = False
 
-app = FastAPI(title="QR Token API", description="API para generar tokens QR con gestión flexible")
+app = FastAPI(title="QR Attendance API", description="API simplificada para generar QRs y registrar asistencia")
 
-# Crear tablas al iniciar
-create_tables()
+# Reiniciar la base de datos al iniciar (elimina esquema anterior)
+print("🚀 Iniciando aplicación...")
+reset_database()
 
-# ============= CONFIGURACIÓN DE EXPIRACIÓN =============
-DURACION_DEFAULT = {
-    "empleado": 8760,  # 1 año en horas (365 días * 24 horas)
-    "jefe": 8760,      # 1 año en horas
-    "temporal": 24,    # 1 día para tokens temporales
-    "visitante": 4     # 4 horas para visitantes
-}
+# ============= MODELOS PYDANTIC =============
 
-# ============= MODELOS PYDANTIC MEJORADOS =============
-
-class TokenGenerationRequest(BaseModel):
+class QRGenerationRequest(BaseModel):
     empleado_id: int
-    duracion_horas: Optional[int] = None  # Si no se especifica, usa el default según tipo
-    tipo_token: str  # "empleado", "jefe", "temporal", "visitante"
-    departamento: Optional[str] = None
-    permisos_especiales: Optional[str] = None
-    descripcion: Optional[str] = None  # Descripción del token para identificación
 
-class TokenUpdateRequest(BaseModel):
-    activo: Optional[bool] = None
-    descripcion: Optional[str] = None
-    extender_horas: Optional[int] = None  # Extender la expiración X horas
-
-class TokenRefreshRequest(BaseModel):
-    token: str
-    nuevas_horas: int = 168  # Default: 1 semana
-
-class QRTokenResponse(BaseModel):
+class QRCodeResponse(BaseModel):
     id: int
-    token: str
     empleado_id: int
-    tipo_token: str
+    qr_code_base64: str
     creado_en: str
-    expira_en: str
-    usado: bool
-    usado_en: Optional[str] = None
-    qrCode: Optional[str] = None
-    departamento: Optional[str] = None
-    permisos_especiales: Optional[str] = None
-    descripcion: Optional[str] = None
     activo: bool
-    dias_restantes: int  # Días hasta expiración
-    estado: str  # "ACTIVO", "EXPIRADO", "DESACTIVADO", "USADO"
+    total_escaneos: int
 
-class TokenValidationResponse(BaseModel):
+class EscaneoResponse(BaseModel):
+    id: int
+    qr_id: int
+    empleado_id: int
+    fecha: str
+    hora_entrada: str
+    hora_salida: Optional[str] = None
+    es_entrada: bool  # True si es entrada, False si es salida
+    duracion_jornada: Optional[str] = None  # Duración en formato "8h 30m" si hay salida
+
+class ValidationResponse(BaseModel):
     valid: bool
     message: str
-    token_data: Optional[dict] = None
-    warnings: List[str] = []  # Advertencias como "expira pronto"
+    qr_data: Optional[dict] = None
+    accion: Optional[str] = None  # "ENTRADA" o "SALIDA"
 
-class AdminTokenListResponse(BaseModel):
-    tokens: List[QRTokenResponse]
-    total: int
-    activos: int
-    expirados: int
-    desactivados: int
+class AttendanceStatsResponse(BaseModel):
+    total_qrs: int
+    total_escaneos: int
+    empleados_registrados: int
+    escaneos_hoy: int
 
-# ============= FUNCIONES AUXILIARES MEJORADAS =============
+# ============= FUNCIONES AUXILIARES =============
 
-def generate_token(length=32):
-    """Genera un token aleatorio seguro"""
+def generate_unique_id(length=16):
+    """Genera un ID único para identificar el QR"""
     alphabet = string.ascii_letters + string.digits
     return ''.join(secrets.choice(alphabet) for _ in range(length))
 
-def generate_qr_code(token: str) -> Optional[str]:
+def generate_qr_code(qr_id: str) -> str:
     """Genera código QR en base64"""
     if not QR_AVAILABLE:
-        return None
+        # Si no está disponible qrcode, generar un placeholder
+        return f"QR_PLACEHOLDER_ID:{qr_id}"
     
     try:
-        img = qrcode.make(token)
+        # El QR contendrá el ID del registro en la BD
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=10,
+            border=4,
+        )
+        qr.add_data(str(qr_id))
+        qr.make(fit=True)
+        
+        img = qr.make_image(fill_color="black", back_color="white")
         buffer = BytesIO()
         img.save(buffer, format="PNG")
         return base64.b64encode(buffer.getvalue()).decode('utf-8')
     except Exception as e:
         print(f"Error generando QR: {e}")
-        return None
+        return f"QR_ERROR_ID:{qr_id}"
 
-def calcular_estado_token(token: QRToken) -> str:
-    """Calcula el estado actual del token"""
-    if not token.activo:
-        return "DESACTIVADO"
-    elif token.usado:
-        return "USADO"
-    elif datetime.utcnow() > token.expira_en:
-        return "EXPIRADO"
-    else:
-        return "ACTIVO"
-
-def calcular_dias_restantes(expira_en: datetime) -> int:
-    """Calcula los días restantes hasta expiración"""
-    diff = expira_en - datetime.utcnow()
-    return max(0, diff.days)
-
-def token_to_response(token: QRToken) -> QRTokenResponse:
-    """Convierte un token de la DB a respuesta con información extendida"""
-    estado = calcular_estado_token(token)
-    dias_restantes = calcular_dias_restantes(token.expira_en)
+def qr_to_response(qr_code: QRCode, db: Session) -> QRCodeResponse:
+    """Convierte un QR code de la DB a respuesta"""
+    total_escaneos = db.query(RegistroEscaneo).filter(RegistroEscaneo.qr_id == qr_code.id).count()
     
-    return QRTokenResponse(
-        id=token.id,
-        token=token.token,
-        empleado_id=token.empleado_id,
-        tipo_token=token.tipo_token.value,
-        creado_en=token.creado_en.isoformat(),
-        expira_en=token.expira_en.isoformat(),
-        usado=token.usado,
-        usado_en=token.usado_en.isoformat() if token.usado_en else None,
-        qrCode=token.qr_code_base64 if token.qr_code_base64 else f"QR_NOT_AVAILABLE_TOKEN:{token.token}",
-        departamento=token.departamento,
-        permisos_especiales=token.permisos_especiales,
-        descripcion=token.descripcion if hasattr(token, 'descripcion') else None,
-        activo=token.activo,
-        dias_restantes=dias_restantes,
-        estado=estado
+    return QRCodeResponse(
+        id=qr_code.id,
+        empleado_id=qr_code.empleado_id,
+        qr_code_base64=qr_code.qr_code_base64,
+        creado_en=qr_code.creado_en.isoformat(),
+        activo=qr_code.activo,
+        total_escaneos=total_escaneos
     )
 
-def get_duracion_default(tipo_token: str) -> int:
-    """Obtiene la duración por defecto según el tipo de token"""
-    return DURACION_DEFAULT.get(tipo_token, DURACION_DEFAULT["empleado"])
+def escaneo_to_response(escaneo: RegistroEscaneo, db: Session) -> EscaneoResponse:
+    """Convierte un registro de escaneo a respuesta"""
+    # Calcular duración si hay hora de salida
+    duracion_jornada = None
+    if escaneo.hora_salida:
+        duracion = escaneo.hora_salida - escaneo.hora_entrada
+        horas = int(duracion.total_seconds() // 3600)
+        minutos = int((duracion.total_seconds() % 3600) // 60)
+        duracion_jornada = f"{horas}h {minutos}m"
+    
+    # Determinar si es entrada (cuando se crea) o salida (cuando se actualiza)
+    es_entrada = escaneo.hora_salida is None
+    
+    return EscaneoResponse(
+        id=escaneo.id,
+        qr_id=escaneo.qr_id,
+        empleado_id=escaneo.empleado_id,
+        fecha=escaneo.fecha.date().isoformat(),
+        hora_entrada=escaneo.hora_entrada.isoformat(),
+        hora_salida=escaneo.hora_salida.isoformat() if escaneo.hora_salida else None,
+        es_entrada=es_entrada,
+        duracion_jornada=duracion_jornada
+    )
 
-# ============= ENDPOINTS PRINCIPALES MEJORADOS =============
+# ============= ENDPOINTS =============
 
 @app.get("/")
 def read_root():
     return {
-        "Hello": "QR Token API - Gestión Flexible", 
-        "version": "3.0.0",
+        "Hello": "QR Attendance API", 
+        "version": "1.0.0",
         "features": [
-            "Tokens de larga duración",
-            "Gestión administrativa",
-            "Refresh de tokens",
-            "Estados detallados"
+            "Generación de códigos QR por empleado",
+            "Registro de escaneos con fecha/hora",
+            "Control de asistencia simplificado"
         ]
     }
 
-@app.post("/tokens/generate", response_model=QRTokenResponse)
-def generate_qr_token(request: TokenGenerationRequest, db: Session = Depends(get_db)):
-    """Genera un nuevo QR token con duración flexible"""
+@app.post("/qr/generate", response_model=QRCodeResponse)
+def generate_qr(request: QRGenerationRequest, db: Session = Depends(get_db)):
+    """Genera un nuevo código QR para un empleado"""
     
-    # Validar tipo de token
-    tipos_validos = ["empleado", "jefe", "temporal", "visitante"]
-    if request.tipo_token not in tipos_validos:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"tipo_token debe ser uno de: {', '.join(tipos_validos)}"
-        )
+    # Verificar si ya existe un QR activo para este empleado
+    existing_qr = db.query(QRCode).filter(
+        QRCode.empleado_id == request.empleado_id,
+        QRCode.activo == True
+    ).first()
     
-    # Usar duración por defecto si no se especifica
-    duracion_horas = request.duracion_horas or get_duracion_default(request.tipo_token)
+    if existing_qr:
+        # Devolver el QR existente en lugar de crear uno nuevo
+        return qr_to_response(existing_qr, db)
     
-    # Validar campos requeridos para jefes
-    if request.tipo_token == "jefe" and not request.departamento:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="El departamento es requerido para tokens de jefe"
-        )
-    
-    # Generar token único
-    token = generate_token()
-    while db.query(QRToken).filter(QRToken.token == token).first():
-        token = generate_token()
-    
-    # Generar QR code
-    qr_code_base64 = generate_qr_code(token)
-    
-    # Crear el token en la base de datos
-    db_token = QRToken(
-        token=token,
+    # Crear nuevo QR en la base de datos primero para obtener el ID
+    db_qr = QRCode(
         empleado_id=request.empleado_id,
-        tipo_token=TokenType.EMPLEADO if request.tipo_token == "empleado" else TokenType.JEFE,
-        expira_en=datetime.utcnow() + timedelta(hours=duracion_horas),
-        qr_code_base64=qr_code_base64,
-        departamento=request.departamento if request.tipo_token in ["jefe"] else None,
-        permisos_especiales=request.permisos_especiales,
-        # Agregar descripción si el modelo de BD lo soporta
-        # descripcion=request.descripcion
+        qr_code_base64="temp"  # Temporal
     )
     
-    db.add(db_token)
+    db.add(db_qr)
     db.commit()
-    db.refresh(db_token)
+    db.refresh(db_qr)
     
-    return token_to_response(db_token)
+    # Generar el código QR usando el ID de la base de datos
+    qr_code_base64 = generate_qr_code(db_qr.id)
+    
+    # Actualizar con el QR generado
+    db_qr.qr_code_base64 = qr_code_base64
+    db.commit()
+    db.refresh(db_qr)
+    
+    return qr_to_response(db_qr, db)
 
-@app.get("/tokens/{token}/validate", response_model=TokenValidationResponse)
-def validate_token(token: str, db: Session = Depends(get_db)):
-    """Valida un token con información detallada y advertencias"""
+@app.get("/qr/{qr_id}/validate", response_model=ValidationResponse)
+def validate_qr(qr_id: int, db: Session = Depends(get_db)):
+    """Valida un código QR y determina si será entrada o salida"""
     
-    db_token = db.query(QRToken).filter(QRToken.token == token).first()
+    qr_code = db.query(QRCode).filter(QRCode.id == qr_id).first()
     
-    if not db_token:
-        return TokenValidationResponse(
+    if not qr_code:
+        return ValidationResponse(
             valid=False,
-            message="Token no encontrado"
+            message="Código QR no encontrado"
         )
     
-    warnings = []
-    
-    # Verificar si está desactivado
-    if not db_token.activo:
-        return TokenValidationResponse(
+    if not qr_code.activo:
+        return ValidationResponse(
             valid=False,
-            message="Token desactivado por administrador",
-            token_data={
-                "empleado_id": db_token.empleado_id,
-                "tipo_token": db_token.tipo_token.value,
-                "estado": "DESACTIVADO"
+            message="Código QR desactivado",
+            qr_data={
+                "empleado_id": qr_code.empleado_id,
+                "activo": False
             }
         )
     
-    # Verificar si ya fue usado
-    if db_token.usado:
-        return TokenValidationResponse(
-            valid=False,
-            message="Token ya fue utilizado",
-            token_data={
-                "usado_en": db_token.usado_en.isoformat() if db_token.usado_en else None,
-                "tipo_token": db_token.tipo_token.value,
-                "empleado_id": db_token.empleado_id,
-                "estado": "USADO"
-            }
-        )
+    # Verificar si hay un registro de entrada sin salida para hoy
+    hoy = datetime.utcnow().date()
+    registro_hoy = db.query(RegistroEscaneo).filter(
+        RegistroEscaneo.qr_id == qr_id,
+        RegistroEscaneo.fecha >= datetime.combine(hoy, datetime.min.time()),
+        RegistroEscaneo.fecha < datetime.combine(hoy, datetime.max.time())
+    ).first()
     
-    # Verificar expiración
-    now = datetime.utcnow()
-    if now > db_token.expira_en:
-        return TokenValidationResponse(
-            valid=False,
-            message="Token expirado",
-            token_data={
-                "expira_en": db_token.expira_en.isoformat(),
-                "tipo_token": db_token.tipo_token.value,
-                "empleado_id": db_token.empleado_id,
-                "estado": "EXPIRADO"
-            }
-        )
+    if registro_hoy:
+        if registro_hoy.hora_salida is None:
+            # Ya tiene entrada, el próximo escaneo será salida
+            accion = "SALIDA"
+            mensaje = f"Registrará salida - Entrada: {registro_hoy.hora_entrada.strftime('%H:%M:%S')}"
+        else:
+            # Ya completó entrada y salida hoy
+            accion = "COMPLETADO"
+            mensaje = f"Ya registró entrada y salida hoy"
+    else:
+        # No hay registro hoy, será entrada
+        accion = "ENTRADA"
+        mensaje = "Registrará entrada"
     
-    # Advertencias por proximidad de expiración
-    dias_restantes = calcular_dias_restantes(db_token.expira_en)
-    if dias_restantes <= 7:
-        warnings.append(f"Token expira en {dias_restantes} días")
-    elif dias_restantes <= 30:
-        warnings.append(f"Token expira en {dias_restantes} días")
-    
-    return TokenValidationResponse(
+    return ValidationResponse(
         valid=True,
-        message="Token válido",
-        warnings=warnings,
-        token_data={
-            "empleado_id": db_token.empleado_id,
-            "tipo_token": db_token.tipo_token.value,
-            "departamento": db_token.departamento,
-            "permisos_especiales": db_token.permisos_especiales,
-            "expira_en": db_token.expira_en.isoformat(),
-            "dias_restantes": dias_restantes,
-            "estado": "ACTIVO"
+        message=mensaje,
+        accion=accion,
+        qr_data={
+            "empleado_id": qr_code.empleado_id,
+            "activo": qr_code.activo,
+            "creado_en": qr_code.creado_en.isoformat()
         }
     )
 
+@app.post("/qr/{qr_id}/scan", response_model=EscaneoResponse)
+def record_scan(qr_id: int, db: Session = Depends(get_db)):
+    """Registra un escaneo del código QR (entrada o salida)"""
+    
+    # Verificar que el QR existe y está activo
+    qr_code = db.query(QRCode).filter(QRCode.id == qr_id).first()
+    
+    if not qr_code:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Código QR no encontrado"
+        )
+    
+    if not qr_code.activo:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Código QR desactivado"
+        )
+    
+    ahora = datetime.utcnow()
+    hoy = ahora.date()
+    
+    # Buscar registro de hoy
+    registro_hoy = db.query(RegistroEscaneo).filter(
+        RegistroEscaneo.qr_id == qr_id,
+        RegistroEscaneo.fecha >= datetime.combine(hoy, datetime.min.time()),
+        RegistroEscaneo.fecha < datetime.combine(hoy, datetime.max.time())
+    ).first()
+    
+    if registro_hoy:
+        if registro_hoy.hora_salida is None:
+            # Registrar salida
+            registro_hoy.hora_salida = ahora
+            db.commit()
+            db.refresh(registro_hoy)
+            return escaneo_to_response(registro_hoy, db)
+        else:
+            # Ya completó entrada y salida
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Ya registró entrada y salida para hoy"
+            )
+    else:
+        # Crear nuevo registro de entrada
+        nuevo_registro = RegistroEscaneo(
+            qr_id=qr_id,
+            empleado_id=qr_code.empleado_id,
+            fecha=ahora,
+            hora_entrada=ahora,
+            hora_salida=None
+        )
+        
+        db.add(nuevo_registro)
+        db.commit()
+        db.refresh(nuevo_registro)
+        
+        return escaneo_to_response(nuevo_registro, db)
+
 # ============= ENDPOINTS ADMINISTRATIVOS =============
 
-@app.get("/admin/tokens", response_model=AdminTokenListResponse)
-def get_all_tokens_admin(
+@app.get("/admin/qrs", response_model=List[QRCodeResponse])
+def get_all_qrs(
     empleado_id: Optional[int] = None,
-    tipo_token: Optional[str] = None,
-    estado: Optional[str] = None,  # ACTIVO, EXPIRADO, DESACTIVADO, USADO
-    departamento: Optional[str] = None,
+    activo: Optional[bool] = None,
     limit: int = 100,
     offset: int = 0,
     db: Session = Depends(get_db)
 ):
-    """Vista administrativa de todos los tokens con filtros avanzados"""
-    query = db.query(QRToken)
+    """Obtiene todos los códigos QR con filtros"""
+    query = db.query(QRCode)
     
-    # Aplicar filtros
     if empleado_id:
-        query = query.filter(QRToken.empleado_id == empleado_id)
+        query = query.filter(QRCode.empleado_id == empleado_id)
     
-    if tipo_token:
-        if tipo_token == "empleado":
-            query = query.filter(QRToken.tipo_token == TokenType.EMPLEADO)
-        elif tipo_token == "jefe":
-            query = query.filter(QRToken.tipo_token == TokenType.JEFE)
+    if activo is not None:
+        query = query.filter(QRCode.activo == activo)
     
-    if departamento:
-        query = query.filter(QRToken.departamento == departamento)
-    
-    # Obtener todos los tokens para calcular estadísticas
-    all_tokens = query.all()
-    
-    # Aplicar filtro de estado después de obtener los datos
-    if estado:
-        filtered_tokens = []
-        for token in all_tokens:
-            token_estado = calcular_estado_token(token)
-            if token_estado == estado:
-                filtered_tokens.append(token)
-        tokens_to_show = filtered_tokens[offset:offset + limit]
-    else:
-        tokens_to_show = all_tokens[offset:offset + limit]
-    
-    # Calcular estadísticas
-    activos = sum(1 for t in all_tokens if calcular_estado_token(t) == "ACTIVO")
-    expirados = sum(1 for t in all_tokens if calcular_estado_token(t) == "EXPIRADO")
-    desactivados = sum(1 for t in all_tokens if calcular_estado_token(t) == "DESACTIVADO")
-    
-    return AdminTokenListResponse(
-        tokens=[token_to_response(token) for token in tokens_to_show],
-        total=len(all_tokens),
-        activos=activos,
-        expirados=expirados,
-        desactivados=desactivados
-    )
+    qrs = query.offset(offset).limit(limit).all()
+    return [qr_to_response(qr, db) for qr in qrs]
 
-@app.put("/admin/tokens/{token}/update")
-def update_token_admin(
-    token: str, 
-    request: TokenUpdateRequest, 
+@app.get("/admin/escaneos", response_model=List[EscaneoResponse])
+def get_all_scans(
+    qr_id: Optional[int] = None,
+    empleado_id: Optional[int] = None,
+    fecha_desde: Optional[str] = None,
+    fecha_hasta: Optional[str] = None,
+    solo_sin_salida: Optional[bool] = False,  # Filtrar solo registros sin hora de salida
+    limit: int = 100,
+    offset: int = 0,
     db: Session = Depends(get_db)
 ):
-    """Actualiza un token (activar/desactivar, extender duración, etc.)"""
+    """Obtiene todos los registros de escaneo con filtros"""
+    query = db.query(RegistroEscaneo)
     
-    db_token = db.query(QRToken).filter(QRToken.token == token).first()
+    if qr_id:
+        query = query.filter(RegistroEscaneo.qr_id == qr_id)
     
-    if not db_token:
+    if empleado_id:
+        query = query.filter(RegistroEscaneo.empleado_id == empleado_id)
+    
+    if fecha_desde:
+        try:
+            fecha_desde_dt = datetime.fromisoformat(fecha_desde)
+            query = query.filter(RegistroEscaneo.fecha >= fecha_desde_dt)
+        except ValueError:
+            pass
+    
+    if fecha_hasta:
+        try:
+            fecha_hasta_dt = datetime.fromisoformat(fecha_hasta)
+            query = query.filter(RegistroEscaneo.fecha <= fecha_hasta_dt)
+        except ValueError:
+            pass
+    
+    if solo_sin_salida:
+        query = query.filter(RegistroEscaneo.hora_salida.is_(None))
+    
+    escaneos = query.order_by(desc(RegistroEscaneo.fecha)).offset(offset).limit(limit).all()
+    return [escaneo_to_response(escaneo, db) for escaneo in escaneos]
+
+@app.get("/admin/empleado/{empleado_id}/escaneos", response_model=List[EscaneoResponse])
+def get_employee_scans(empleado_id: int, db: Session = Depends(get_db)):
+    """Obtiene todos los escaneos de un empleado específico"""
+    escaneos = db.query(RegistroEscaneo).filter(
+        RegistroEscaneo.empleado_id == empleado_id
+    ).order_by(desc(RegistroEscaneo.fecha)).all()
+    
+    return [escaneo_to_response(escaneo, db) for escaneo in escaneos]
+
+@app.put("/admin/qr/{qr_id}/toggle")
+def toggle_qr_status(qr_id: int, db: Session = Depends(get_db)):
+    """Activa/desactiva un código QR"""
+    
+    qr_code = db.query(QRCode).filter(QRCode.id == qr_id).first()
+    
+    if not qr_code:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Token no encontrado"
+            detail="Código QR no encontrado"
         )
     
-    # Actualizar campos
-    if request.activo is not None:
-        db_token.activo = request.activo
-    
-    if request.extender_horas:
-        db_token.expira_en = db_token.expira_en + timedelta(hours=request.extender_horas)
-    
-    # Si el modelo soporta descripción
-    # if request.descripcion is not None:
-    #     db_token.descripcion = request.descripcion
-    
+    qr_code.activo = not qr_code.activo
     db.commit()
-    db.refresh(db_token)
     
     return {
         "success": True,
-        "message": "Token actualizado exitosamente",
-        "token": token_to_response(db_token)
+        "message": f"QR {'activado' if qr_code.activo else 'desactivado'}",
+        "qr_id": qr_id,
+        "activo": qr_code.activo
     }
 
-@app.post("/admin/tokens/{token}/refresh")
-def refresh_token(token: str, request: TokenRefreshRequest, db: Session = Depends(get_db)):
-    """Extiende la duración de un token existente"""
+@app.delete("/admin/qr/{qr_id}")
+def delete_qr(qr_id: int, db: Session = Depends(get_db)):
+    """Elimina un código QR y todos sus escaneos"""
     
-    db_token = db.query(QRToken).filter(QRToken.token == token).first()
+    qr_code = db.query(QRCode).filter(QRCode.id == qr_id).first()
     
-    if not db_token:
+    if not qr_code:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Token no encontrado"
+            detail="Código QR no encontrado"
         )
     
-    # Extender la expiración
-    nueva_expiracion = datetime.utcnow() + timedelta(hours=request.nuevas_horas)
-    db_token.expira_en = nueva_expiracion
+    # Eliminar escaneos asociados
+    escaneos_eliminados = db.query(RegistroEscaneo).filter(RegistroEscaneo.qr_id == qr_id).delete()
     
-    # Reactivar el token si estaba desactivado
-    if not db_token.activo:
-        db_token.activo = True
-    
-    # Si estaba marcado como usado, resetear (opcional, según lógica de negocio)
-    # db_token.usado = False
-    # db_token.usado_en = None
-    
+    # Eliminar QR
+    db.delete(qr_code)
     db.commit()
-    db.refresh(db_token)
     
     return {
         "success": True,
-        "message": f"Token extendido por {request.nuevas_horas} horas",
-        "nueva_expiracion": nueva_expiracion.isoformat(),
-        "token": token_to_response(db_token)
+        "message": f"QR eliminado junto con {escaneos_eliminados} escaneos",
+        "qr_id": qr_id,
+        "escaneos_eliminados": escaneos_eliminados
     }
 
-@app.post("/admin/empleados/{empleado_id}/deactivate-tokens")
-def deactivate_employee_tokens(empleado_id: int, db: Session = Depends(get_db)):
-    """Desactiva todos los tokens de un empleado (simula despido)"""
+# ============= ENDPOINTS ESPECÍFICOS PARA ENTRADA/SALIDA =============
+
+@app.get("/admin/empleados/sin-salida")
+def get_employees_without_exit(db: Session = Depends(get_db)):
+    """Obtiene empleados que tienen entrada pero no salida hoy"""
+    hoy = datetime.utcnow().date()
     
-    tokens = db.query(QRToken).filter(
-        and_(
-            QRToken.empleado_id == empleado_id,
-            QRToken.activo == True
-        )
+    registros_sin_salida = db.query(RegistroEscaneo).filter(
+        RegistroEscaneo.fecha >= datetime.combine(hoy, datetime.min.time()),
+        RegistroEscaneo.fecha < datetime.combine(hoy, datetime.max.time()),
+        RegistroEscaneo.hora_salida.is_(None)
     ).all()
     
-    if not tokens:
-        return {
-            "success": True,
-            "message": "No se encontraron tokens activos para este empleado",
-            "tokens_desactivados": 0
-        }
+    empleados_info = []
+    for registro in registros_sin_salida:
+        empleados_info.append({
+            "empleado_id": registro.empleado_id,
+            "hora_entrada": registro.hora_entrada.isoformat(),
+            "tiempo_transcurrido": str(datetime.utcnow() - registro.hora_entrada).split('.')[0]
+        })
     
-    # Desactivar todos los tokens
-    for token in tokens:
-        token.activo = False
+    return {
+        "total": len(empleados_info),
+        "empleados": empleados_info
+    }
+
+@app.post("/admin/registro/{registro_id}/forzar-salida")
+def force_exit(registro_id: int, db: Session = Depends(get_db)):
+    """Fuerza una salida para un registro específico (uso administrativo)"""
+    registro = db.query(RegistroEscaneo).filter(RegistroEscaneo.id == registro_id).first()
     
+    if not registro:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Registro no encontrado"
+        )
+    
+    if registro.hora_salida:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Este registro ya tiene hora de salida"
+        )
+    
+    registro.hora_salida = datetime.utcnow()
     db.commit()
     
     return {
         "success": True,
-        "message": f"Se desactivaron {len(tokens)} tokens del empleado {empleado_id}",
-        "tokens_desactivados": len(tokens),
-        "empleado_id": empleado_id
+        "message": "Salida forzada registrada",
+        "registro": escaneo_to_response(registro, db)
     }
 
-@app.post("/admin/cleanup/expired")
-def cleanup_expired_tokens(db: Session = Depends(get_db)):
-    """Limpia tokens expirados (los desactiva)"""
-    
-    tokens_expirados = db.query(QRToken).filter(
-        and_(
-            QRToken.expira_en < datetime.utcnow(),
-            QRToken.activo == True
+@app.get("/admin/reporte-diario/{fecha}")
+def daily_report(fecha: str, db: Session = Depends(get_db)):
+    """Genera reporte diario de asistencia"""
+    try:
+        fecha_obj = datetime.fromisoformat(fecha).date()
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Formato de fecha inválido. Use YYYY-MM-DD"
         )
+    
+    # Obtener todos los registros del día
+    registros = db.query(RegistroEscaneo).filter(
+        RegistroEscaneo.fecha >= datetime.combine(fecha_obj, datetime.min.time()),
+        RegistroEscaneo.fecha < datetime.combine(fecha_obj, datetime.max.time())
     ).all()
     
-    for token in tokens_expirados:
-        token.activo = False
+    # Estadísticas
+    total_empleados = len(set(r.empleado_id for r in registros))
+    con_entrada = len(registros)
+    con_salida = len([r for r in registros if r.hora_salida])
+    sin_salida = con_entrada - con_salida
     
-    db.commit()
+    # Detalle por empleado
+    empleados_detalle = []
+    for registro in registros:
+        duracion = None
+        if registro.hora_salida:
+            diff = registro.hora_salida - registro.hora_entrada
+            horas = int(diff.total_seconds() // 3600)
+            minutos = int((diff.total_seconds() % 3600) // 60)
+            duracion = f"{horas}h {minutos}m"
+        
+        empleados_detalle.append({
+            "empleado_id": registro.empleado_id,
+            "hora_entrada": registro.hora_entrada.strftime("%H:%M:%S"),
+            "hora_salida": registro.hora_salida.strftime("%H:%M:%S") if registro.hora_salida else None,
+            "duracion_jornada": duracion,
+            "completo": registro.hora_salida is not None
+        })
     
     return {
-        "success": True,
-        "message": f"Se desactivaron {len(tokens_expirados)} tokens expirados",
-        "tokens_limpiados": len(tokens_expirados)
+        "fecha": fecha,
+        "estadisticas": {
+            "total_empleados": total_empleados,
+            "con_entrada": con_entrada,
+            "con_salida": con_salida,
+            "sin_salida": sin_salida
+        },
+        "empleados": empleados_detalle
     }
 
-# ============= ENDPOINTS PARA EMPLEADOS (MANTENIDOS) =============
+# ============= ESTADÍSTICAS =============
 
-@app.post("/empleados/tokens/generate", response_model=QRTokenResponse)
-def generate_empleado_token(
-    empleado_id: int, 
-    duracion_horas: Optional[int] = None,
-    descripcion: Optional[str] = None,
-    db: Session = Depends(get_db)
-):
-    """Genera un token de empleado con duración extendida"""
-    request = TokenGenerationRequest(
-        empleado_id=empleado_id,
-        duracion_horas=duracion_horas,
-        tipo_token="empleado",
-        descripcion=descripcion
+@app.get("/stats", response_model=AttendanceStatsResponse)
+def get_attendance_stats(db: Session = Depends(get_db)):
+    """Obtiene estadísticas de asistencia"""
+    
+    # Contar totales
+    total_qrs = db.query(QRCode).count()
+    total_escaneos = db.query(RegistroEscaneo).count()
+    
+    # Empleados únicos con QR
+    empleados_registrados = db.query(QRCode.empleado_id).distinct().count()
+    
+    # Escaneos de hoy
+    hoy = datetime.utcnow().date()
+    escaneos_hoy = db.query(RegistroEscaneo).filter(
+        RegistroEscaneo.fecha >= datetime.combine(hoy, datetime.min.time()),
+        RegistroEscaneo.fecha < datetime.combine(hoy, datetime.max.time())
+    ).count()
+    
+    return AttendanceStatsResponse(
+        total_qrs=total_qrs,
+        total_escaneos=total_escaneos,
+        empleados_registrados=empleados_registrados,
+        escaneos_hoy=escaneos_hoy
     )
-    return generate_qr_token(request, db)
-
-@app.get("/empleados/{empleado_id}/tokens", response_model=List[QRTokenResponse])
-def get_empleado_tokens(empleado_id: int, incluir_inactivos: bool = False, db: Session = Depends(get_db)):
-    """Obtiene tokens de un empleado con opción de incluir inactivos"""
-    query = db.query(QRToken).filter(QRToken.empleado_id == empleado_id)
-    
-    if not incluir_inactivos:
-        query = query.filter(QRToken.activo == True)
-    
-    tokens = query.all()
-    return [token_to_response(token) for token in tokens]
-
-# ============= INFORMACIÓN DEL SISTEMA =============
 
 @app.get("/info")
 def get_system_info(db: Session = Depends(get_db)):
-    """Información del sistema con estadísticas detalladas"""
-    all_tokens = db.query(QRToken).all()
-    
-    # Calcular estadísticas por estado
-    activos = sum(1 for t in all_tokens if calcular_estado_token(t) == "ACTIVO")
-    expirados = sum(1 for t in all_tokens if calcular_estado_token(t) == "EXPIRADO")
-    desactivados = sum(1 for t in all_tokens if calcular_estado_token(t) == "DESACTIVADO")
-    usados = sum(1 for t in all_tokens if calcular_estado_token(t) == "USADO")
-    
-    # Estadísticas por tipo
-    empleado_tokens = sum(1 for t in all_tokens if t.tipo_token == TokenType.EMPLEADO)
-    jefe_tokens = sum(1 for t in all_tokens if t.tipo_token == TokenType.JEFE)
-    
-    # Próximos a expirar (30 días)
-    proximos_expirar = sum(1 for t in all_tokens 
-                          if calcular_estado_token(t) == "ACTIVO" 
-                          and calcular_dias_restantes(t.expira_en) <= 30)
+    """Información del sistema con estadísticas"""
+    stats = get_attendance_stats(db)
     
     return {
-        "app": "QR Token Generator - Gestión Flexible",
-        "version": "3.0.0",
+        "app": "QR Attendance API",
+        "version": "1.0.0",
         "database": "PostgreSQL (Neon)",
-        "estadisticas": {
-            "total_tokens": len(all_tokens),
-            "por_estado": {
-                "activos": activos,
-                "expirados": expirados,
-                "desactivados": desactivados,
-                "usados": usados
-            },
-            "por_tipo": {
-                "empleados": empleado_tokens,
-                "jefes": jefe_tokens
-            },
-            "proximos_expirar_30_dias": proximos_expirar
+        "qr_available": QR_AVAILABLE,
+        "attendance_stats": {
+            "total_qrs": stats.total_qrs,
+            "total_escaneos": stats.total_escaneos,
+            "empleados_registrados": stats.empleados_registrados,
+            "escaneos_hoy": stats.escaneos_hoy
         },
-        "configuracion": {
-            "duracion_default": DURACION_DEFAULT,
-            "qr_disponible": QR_AVAILABLE
+        "features": [
+            "Generación de QR por empleado",
+            "Registro de múltiples escaneos",
+            "Control de asistencia sin tokens",
+            "Estadísticas en tiempo real"
+        ]
+    }
+
+# ============= ENDPOINTS LEGACY PARA COMPATIBILIDAD CON EL SCANNER =============
+
+@app.post("/tokens/{qr_id}/record_scan")
+def legacy_record_scan(qr_id: str, db: Session = Depends(get_db)):
+    """Endpoint legacy para compatibilidad con el scanner existente"""
+    try:
+        # Convertir qr_id a int
+        qr_id_int = int(qr_id)
+        escaneo = record_scan(qr_id_int, db)
+        
+        return {
+            "success": True,
+            "message": "Escaneo registrado",
+            "is_first_scan": escaneo.es_entrada,  # True si es entrada, False si es salida
+            "empleado_id": escaneo.empleado_id,
+            "fecha_escaneo": escaneo.hora_entrada if escaneo.es_entrada else escaneo.hora_salida,
+            "accion": "ENTRADA" if escaneo.es_entrada else "SALIDA"
         }
-    }
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="ID de QR inválido"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
 
-# ============= ENDPOINTS LEGACY (MANTENIDOS PARA COMPATIBILIDAD) =============
-
-@app.get("/generate-qr-token")
-def generate_qr_token_legacy(empleado_id: int = 1, db: Session = Depends(get_db)):
-    """Genera un token de empleado (LEGACY) - ahora con duración extendida"""
-    return generate_empleado_token(empleado_id, None, "Token legacy", db)
-
-@app.get("/validate-token/{token}")
-def validate_token_legacy(token: str, db: Session = Depends(get_db)):
-    """Valida un token (LEGACY)"""
-    return validate_token(token, db)
-
-@app.post("/use-token/{token}")
-def use_token_legacy(token: str, db: Session = Depends(get_db)):
-    """Usa un token (LEGACY)"""
-    return use_token(token, db)
-
-@app.post("/tokens/{token}/use")
-def use_token(token: str, db: Session = Depends(get_db)):
-    """Marca un token como usado"""
-    
-    db_token = db.query(QRToken).filter(QRToken.token == token).first()
-    
-    if not db_token:
-        return {"success": False, "message": "Token no encontrado"}
-    
-    if not db_token.activo:
-        return {"success": False, "message": "Token desactivado"}
-    
-    if db_token.usado:
-        return {"success": False, "message": "Token ya fue usado"}
-    
-    if datetime.utcnow() > db_token.expira_en:
-        return {"success": False, "message": "Token expirado"}
-    
-    # Marcar como usado
-    db_token.usado = True
-    db_token.usado_en = datetime.utcnow()
-    db.commit()
-    
-    return {
-        "success": True,
-        "message": "Token usado exitosamente",
-        "empleado_id": db_token.empleado_id,
-        "tipo_token": db_token.tipo_token.value,
-        "departamento": db_token.departamento,
-        "usado_en": db_token.usado_en.isoformat(),
-        "estado": "USADO"
-    }
+@app.get("/tokens/{qr_id}/validate")
+def legacy_validate(qr_id: str, db: Session = Depends(get_db)):
+    """Endpoint legacy para validación compatible con el scanner"""
+    try:
+        qr_id_int = int(qr_id)
+        validation = validate_qr(qr_id_int, db)
+        
+        if validation.valid:
+            # Obtener registros para mostrar en el scanner
+            registros = db.query(RegistroEscaneo).filter(
+                RegistroEscaneo.qr_id == qr_id_int
+            ).order_by(desc(RegistroEscaneo.fecha)).all()
+            
+            # Crear lista de escaneos previos (entradas y salidas)
+            previous_scans = []
+            for registro in registros:
+                previous_scans.append(registro.hora_entrada.isoformat())
+                if registro.hora_salida:
+                    previous_scans.append(registro.hora_salida.isoformat())
+            
+            # Obtener último registro para mostrar información
+            ultimo_registro = registros[0] if registros else None
+            usado_en = None
+            if ultimo_registro:
+                if ultimo_registro.hora_salida:
+                    usado_en = ultimo_registro.hora_salida.isoformat()
+                else:
+                    usado_en = ultimo_registro.hora_entrada.isoformat()
+            
+            return {
+                "valid": True,
+                "message": validation.message,
+                "token_data": {
+                    "empleado_id": validation.qr_data["empleado_id"],
+                    "estado": "ACTIVO",
+                    "usado_en": usado_en,
+                    "accion": validation.accion
+                },
+                "first_scan": validation.accion == "ENTRADA",
+                "previous_scans": previous_scans
+            }
+        else:
+            return {
+                "valid": False,
+                "message": validation.message,
+                "token_data": validation.qr_data or {},
+                "first_scan": False,
+                "previous_scans": []
+            }
+    except ValueError:
+        return {
+            "valid": False,
+            "message": "ID de QR inválido",
+            "token_data": {},
+            "first_scan": False,
+            "previous_scans": []
+        }
+    except Exception as e:
+        return {
+            "valid": False,
+            "message": f"Error del servidor: {str(e)}",
+            "token_data": {},
+            "first_scan": False,
+            "previous_scans": []
+        }

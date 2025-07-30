@@ -1,8 +1,7 @@
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Text, Enum
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Text, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
-import enum
 
 # URL de conexión a Neon
 DATABASE_URL = 'postgresql://neondb_owner:npg_21fFSKavmgOE@ep-gentle-term-ae4qpxn7-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require'
@@ -16,29 +15,46 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 # Base para los modelos
 Base = declarative_base()
 
-# Enum para tipos de token
-class TokenType(enum.Enum):
-    EMPLEADO = "empleado"
-    JEFE = "jefe"
-
-# Modelo para los QR Tokens
-class QRToken(Base):
-    __tablename__ = "qr_tokens"
+# Modelo para los códigos QR
+class QRCode(Base):
+    __tablename__ = "qr_codes"
     
     id = Column(Integer, primary_key=True, index=True)
-    token = Column(String(255), unique=True, index=True, nullable=False)
     empleado_id = Column(Integer, nullable=False, index=True)
-    tipo_token = Column(Enum(TokenType), nullable=False, index=True)
+    qr_code_base64 = Column(Text, nullable=False)
     creado_en = Column(DateTime, default=datetime.utcnow, nullable=False)
-    expira_en = Column(DateTime, nullable=False)
-    usado = Column(Boolean, default=False, nullable=False)
-    usado_en = Column(DateTime, nullable=True)
-    qr_code_base64 = Column(Text, nullable=True)
     activo = Column(Boolean, default=True, nullable=False)
     
-    # Campos adicionales para jefes
-    departamento = Column(String(100), nullable=True)
-    permisos_especiales = Column(Text, nullable=True)
+    # Relación con registros de escaneo
+    escaneos = relationship("RegistroEscaneo", back_populates="qr_code")
+
+# Modelo para los registros de escaneo
+class RegistroEscaneo(Base):
+    __tablename__ = "registros_escaneo"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    qr_id = Column(Integer, ForeignKey("qr_codes.id"), nullable=False)
+    empleado_id = Column(Integer, nullable=False)
+    fecha = Column(DateTime, default=datetime.utcnow, nullable=False)  # Solo la fecha del registro
+    hora_entrada = Column(DateTime, nullable=False)  # Hora de entrada
+    hora_salida = Column(DateTime, nullable=True)    # Hora de salida (puede ser null)
+    
+    # Relación con QR code
+    qr_code = relationship("QRCode", back_populates="escaneos")
+
+# Función para reiniciar la base de datos
+def reset_database():
+    """Elimina todas las tablas y las vuelve a crear"""
+    print("🔄 Reiniciando base de datos...")
+    
+    # Eliminar todas las tablas
+    Base.metadata.drop_all(bind=engine)
+    print("✅ Tablas eliminadas")
+    
+    # Crear las tablas nuevamente
+    Base.metadata.create_all(bind=engine)
+    print("✅ Tablas creadas")
+    print("🎉 Base de datos reiniciada correctamente")
 
 # Crear las tablas
 def create_tables():
